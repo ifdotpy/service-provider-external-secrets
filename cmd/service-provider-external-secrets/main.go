@@ -114,6 +114,7 @@ func initMcpScheme() {
 func main() {
 	var command string
 	var environment, providerName string
+	var kcpEndpointSlice, kcpKubeconfig string
 	var metricsAddr string
 	var metricsCertPath, metricsCertName, metricsCertKey string
 	var webhookCertPath, webhookCertName, webhookCertKey string
@@ -127,6 +128,8 @@ func main() {
 
 	flag.StringVar(&environment, "environment", "", "Name of the environment")
 	flag.StringVar(&providerName, "provider-name", "", "Name of the provider resource")
+	flag.StringVar(&kcpEndpointSlice, "kcp-endpoint-slice", "", "Name of the kcp APIExportEndpointSlice to consume. If set, the provider runs in the multicluster (kcp) deployment mode instead of watching an onboarding cluster.")
+	flag.StringVar(&kcpKubeconfig, "kcp-kubeconfig", "", "Path to the kubeconfig for the kcp workspace that holds the APIExportEndpointSlice (multicluster mode only).")
 	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "The address the metrics endpoint binds to. "+
 		"Use :8443 for HTTPS or :8080 for HTTP, or leave as 0 to disable the metrics service.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
@@ -246,6 +249,41 @@ func main() {
 		WithTimeout(30 * time.Minute)
 	ctx := context.Background()
 	// init (job that installs CRDs)
+	if command == "init" && kcpEndpointSlice != "" {
+		// Multicluster (kcp) mode: no onboarding cluster exists. The service
+		// API is served by an APIExport in kcp; only the platform-side CRDs
+		// (ProviderConfig) are installed, and the served GVKs are registered
+		// at the ServiceProvider as in the classic mode.
+		platformCRDs := func() ([]*apiextensionv1.CustomResourceDefinition, error) {
+			all, err := crds.CRDs()
+			if err != nil {
+				return nil, err
+			}
+			filtered := make([]*apiextensionv1.CustomResourceDefinition, 0, len(all))
+			for _, crd := range all {
+				if crd.Labels[openmcpconst.ClusterLabel] == clustersv1alpha1.PURPOSE_PLATFORM {
+					filtered = append(filtered, crd)
+				}
+			}
+			return filtered, nil
+		}
+		crdManager := crdutil.NewCRDManager(openmcpconst.ClusterLabel, platformCRDs)
+		crdManager.AddCRDLabelToClusterMapping(clustersv1alpha1.PURPOSE_PLATFORM, platformCluster)
+		if err := crdManager.CreateOrUpdateCRDs(ctx, &log); err != nil {
+			setupLog.Error(err, "Failed to create or update CRDs")
+			os.Exit(1)
+		}
+		spGVK := metav1.GroupVersionKind{
+			Group:   externalsecretsoperatorsv1alpha1.GroupVersion.Group,
+			Version: externalsecretsoperatorsv1alpha1.GroupVersion.Version,
+			Kind:    "ExternalSecretsOperator",
+		}
+		if err := utils.RegisterGVKsAtServiceProvider(ctx, platformCluster.Client(), providerName, spGVK); err != nil {
+			setupLog.Error(err, "Failed to register GVK at ServiceProvider")
+			os.Exit(1)
+		}
+		return
+	}
 	if command == "init" {
 		initPermissions := []clustersv1alpha1.PermissionsRequest{
 			{
@@ -286,6 +324,46 @@ func main() {
 		return
 	}
 	// run (sp controller deployment)
+	mcpClusterRequest := advanced.ExistingClusterRequest("mcp", "mcp", func(req reconcile.Request, _ ...any) (*common.ObjectReference, error) {
+		namespace, err := utils.StableMCPNamespace(req.Name, req.Namespace)
+		if err != nil {
+			return nil, err
+		}
+		return &common.ObjectReference{
+			Name:      req.Name,
+			Namespace: namespace,
+		}, nil
+	}).
+		WithNamespaceGenerator(advanced.DefaultNamespaceGeneratorForMCP).
+		WithTokenAccessGenerator(externalsecrets.TokenAccesGenerator).
+		WithScheme(mcpScheme).
+		Build()
+
+	clusterAccessReconciler := advanced.NewClusterAccessReconciler(platformCluster.Client(), "ExternalSecretsOperator")
+	if debugEnabled() {
+		clusterAccessReconciler = localaccess.NewLocalAdvancedClusterAccessReconciler(clusterAccessReconciler)
+	}
+
+	clusterAccessReconciler.
+		WithManagedLabels(func(controllerName string, req reconcile.Request, reg advanced.ClusterRegistration) (string, string, map[string]string) {
+			_, managedPurpose, _ := advanced.DefaultManagedLabelGenerator(controllerName, req, reg)
+			return controllerName, managedPurpose, map[string]string{
+				openmcpconst.OnboardingNameLabel:      req.Name,
+				openmcpconst.OnboardingNamespaceLabel: req.Namespace,
+			}
+		}).
+		WithRetryInterval(10 * time.Second).
+		Register(mcpClusterRequest)
+
+	if kcpEndpointSlice != "" {
+		if err := runMulticluster(log, platformCluster, clusterAccessReconciler, podNamespace, providerName,
+			kcpEndpointSlice, kcpKubeconfig, probeAddr, metricsServerOptions); err != nil {
+			setupLog.Error(err, "problem running multicluster manager")
+			os.Exit(1)
+		}
+		return
+	}
+
 	runPermissions := []clustersv1alpha1.PermissionsRequest{
 		{
 
@@ -332,36 +410,6 @@ func main() {
 		os.Exit(1)
 	}
 
-	mcpClusterRequest := advanced.ExistingClusterRequest("mcp", "mcp", func(req reconcile.Request, _ ...any) (*common.ObjectReference, error) {
-		namespace, err := utils.StableMCPNamespace(req.Name, req.Namespace)
-		if err != nil {
-			return nil, err
-		}
-		return &common.ObjectReference{
-			Name:      req.Name,
-			Namespace: namespace,
-		}, nil
-	}).
-		WithNamespaceGenerator(advanced.DefaultNamespaceGeneratorForMCP).
-		WithTokenAccessGenerator(externalsecrets.TokenAccesGenerator).
-		WithScheme(mcpScheme).
-		Build()
-
-	clusterAccessReconciler := advanced.NewClusterAccessReconciler(platformCluster.Client(), "ExternalSecretsOperator")
-	if debugEnabled() {
-		clusterAccessReconciler = localaccess.NewLocalAdvancedClusterAccessReconciler(clusterAccessReconciler)
-	}
-
-	clusterAccessReconciler.
-		WithManagedLabels(func(controllerName string, req reconcile.Request, reg advanced.ClusterRegistration) (string, string, map[string]string) {
-			_, managedPurpose, _ := advanced.DefaultManagedLabelGenerator(controllerName, req, reg)
-			return controllerName, managedPurpose, map[string]string{
-				openmcpconst.OnboardingNameLabel:      req.Name,
-				openmcpconst.OnboardingNamespaceLabel: req.Namespace,
-			}
-		}).
-		WithRetryInterval(10 * time.Second).
-		Register(mcpClusterRequest)
 	spr := serviceprovider.NewAPIReconcilerBuilder[*externalsecretsoperatorsv1alpha1.ExternalSecretsOperator, *externalsecretsoperatorsv1alpha1.ProviderConfig]().
 		EmptyObjectProvider(func() *externalsecretsoperatorsv1alpha1.ExternalSecretsOperator {
 			return &externalsecretsoperatorsv1alpha1.ExternalSecretsOperator{}
