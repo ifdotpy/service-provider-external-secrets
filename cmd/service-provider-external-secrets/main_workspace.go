@@ -188,6 +188,12 @@ func (h *esoWorkspaceHandler) Ensure(ctx context.Context, ws workspace.Workspace
 }
 
 func (h *esoWorkspaceHandler) Remove(ctx context.Context, ws workspace.Workspace) error {
+	// Revoke the workspace credential first (the workspace client of ws no
+	// longer works after a disengagement; Revoke uses the provider identity).
+	if err := workspace.Revoke(ctx, h.providerCfg, ws.Name, workspace.TokenSpec{
+		Namespace: wsESONamespace, ServiceAccountName: wsESOSA, ClusterRole: "cluster-admin"}, h.platformNamespace(ws)); err != nil {
+		h.log.Error(err, "revoking workspace credential", "workspace", ws.Name)
+	}
 	nsName := h.platformNamespace(ws)
 	hr := &helmv2.HelmRelease{ObjectMeta: metav1.ObjectMeta{Name: "external-secrets", Namespace: nsName}}
 	if err := h.platform.Delete(ctx, hr); err != nil && !apierrors.IsNotFound(err) {
