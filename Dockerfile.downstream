@@ -1,0 +1,3 @@
+FROM gcr.io/distroless/static-debian12:nonroot
+COPY bin/service-provider-external-secrets-linux /service-provider-external-secrets
+ENTRYPOINT ["/service-provider-external-secrets"]

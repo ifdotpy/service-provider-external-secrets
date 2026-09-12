@@ -114,7 +114,7 @@ func initMcpScheme() {
 func main() {
 	var command string
 	var environment, providerName string
-	var kcpEndpointSlice, kcpKubeconfig string
+	var kcpEndpointSlice, kcpKubeconfig, kcpTarget string
 	var metricsAddr string
 	var metricsCertPath, metricsCertName, metricsCertKey string
 	var webhookCertPath, webhookCertName, webhookCertKey string
@@ -130,6 +130,7 @@ func main() {
 	flag.StringVar(&providerName, "provider-name", "", "Name of the provider resource")
 	flag.StringVar(&kcpEndpointSlice, "kcp-endpoint-slice", "", "Name of the kcp APIExportEndpointSlice to consume. If set, the provider runs in the multicluster (kcp) deployment mode instead of watching an onboarding cluster.")
 	flag.StringVar(&kcpKubeconfig, "kcp-kubeconfig", "", "Path to the kubeconfig for the kcp workspace that holds the APIExportEndpointSlice (multicluster mode only).")
+	flag.StringVar(&kcpTarget, "kcp-target", "controlplane", "Target of the service in kcp mode: 'controlplane' (object per ControlPlane) or 'workspace' (one ESO instance per enabled workspace, acting on the workspace itself).")
 	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "The address the metrics endpoint binds to. "+
 		"Use :8443 for HTTPS or :8080 for HTTP, or leave as 0 to disable the metrics service.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
@@ -355,6 +356,14 @@ func main() {
 		WithRetryInterval(10 * time.Second).
 		Register(mcpClusterRequest)
 
+	if kcpEndpointSlice != "" && kcpTarget == "workspace" {
+		if err := runWorkspaceTarget(log, platformCluster, podNamespace, providerName,
+			kcpEndpointSlice, kcpKubeconfig, probeAddr, metricsServerOptions); err != nil {
+			setupLog.Error(err, "problem running workspace-target manager")
+			os.Exit(1)
+		}
+		return
+	}
 	if kcpEndpointSlice != "" {
 		if err := runMulticluster(log, platformCluster, clusterAccessReconciler, podNamespace, providerName,
 			kcpEndpointSlice, kcpKubeconfig, probeAddr, metricsServerOptions); err != nil {
