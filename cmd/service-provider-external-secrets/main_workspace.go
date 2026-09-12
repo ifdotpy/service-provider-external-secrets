@@ -26,8 +26,8 @@ import (
 	sourcev1 "github.com/fluxcd/source-controller/api/v1"
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
@@ -114,13 +114,22 @@ const (
 	kubeconfigMount = "/etc/kcp"
 )
 
-func (h *esoWorkspaceHandler) platformNamespace(ws workspace.Workspace) string { return "eso-ws-" + ws.Name }
+func (h *esoWorkspaceHandler) platformNamespace(ws workspace.Workspace) string {
+	return "eso-ws-" + ws.Name
+}
 
 func (h *esoWorkspaceHandler) Ensure(ctx context.Context, ws workspace.Workspace) error {
 	kubeconfig, err := workspace.MintKubeconfig(ctx, ws, h.providerCfg, workspace.TokenSpec{
 		Namespace: wsESONamespace, ServiceAccountName: wsESOSA, ClusterRole: "cluster-admin"})
 	if err != nil {
 		return fmt.Errorf("minting workspace kubeconfig: %w", err)
+	}
+	// The operator keeps its leader-election Lease in the namespace it runs in
+	// (read from the mounted ServiceAccount, not configurable), so the instance
+	// namespace also exists in the workspace.
+	nsName := h.platformNamespace(ws)
+	if err := ws.Client.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: nsName}}); err != nil && !apierrors.IsAlreadyExists(err) {
+		return fmt.Errorf("instance namespace in workspace: %w", err)
 	}
 	pc := &esov1alpha1.ProviderConfig{}
 	if err := h.platform.Get(ctx, client.ObjectKey{Name: h.providerName}, pc); err != nil {
@@ -135,7 +144,6 @@ func (h *esoWorkspaceHandler) Ensure(ctx context.Context, ws workspace.Workspace
 		chartURL = *ver.ChartURL
 	}
 
-	nsName := h.platformNamespace(ws)
 	ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: nsName,
 		Labels: map[string]string{"open-control-plane.io/workspace": ws.Name, "open-control-plane.io/service": "external-secrets"}}}
 	if err := h.platform.Create(ctx, ns); err != nil && !apierrors.IsAlreadyExists(err) {
@@ -152,7 +160,7 @@ func (h *esoWorkspaceHandler) Ensure(ctx context.Context, ws workspace.Workspace
 	if _, err := ctrl.CreateOrUpdate(ctx, h.platform, repo, func() error {
 		repo.Spec = sourcev1.OCIRepositorySpec{
 			URL: chartURL, Reference: &sourcev1.OCIRepositoryRef{Tag: ver.ChartVersion},
-			Interval: metav1.Duration{Duration: 10 * time.Minute},
+			Interval:      metav1.Duration{Duration: 10 * time.Minute},
 			LayerSelector: &sourcev1.OCILayerSelector{MediaType: "application/vnd.cncf.helm.chart.content.v1.tar+gzip", Operation: sourcev1.OCILayerExtract},
 		}
 		return nil
